@@ -84,6 +84,10 @@ def delete_note():
         update_treeview()
         new_note()  # clear the editor
 
+# Info button popup
+def show_info():
+    messagebox.showinfo("Info", "Right click for copy and paste")
+
 # -------------------------------
 # Create the main window
 root = tk.Tk()
@@ -133,6 +137,10 @@ editor_frame.rowconfigure(1, weight=1)
 button_frame = ttk.Frame(editor_frame)
 button_frame.grid(row=2, column=1, pady=10, sticky="E")
 
+# buttons
+info_button = ttk.Button(button_frame, text="Info", command=show_info, style="warning.TButton")
+info_button.pack(side=tk.LEFT, padx=(0, 5))
+
 new_button = ttk.Button(button_frame, text="New Note", command=new_note, style="info.TButton")
 new_button.pack(side=tk.LEFT, padx=(0, 5))
 
@@ -141,6 +149,24 @@ save_button.pack(side=tk.LEFT, padx=(0, 5))
 
 delete_button = ttk.Button(button_frame, text="Delete", command=delete_note, style="primary.TButton")
 delete_button.pack(side=tk.LEFT)
+
+#copy and paste menu
+def show_context_menu(event):
+    widget = event.widget
+    menu = tk.Menu(widget, tearoff=0)
+    menu.add_command(label="Cut", command=lambda w=widget: w.event_generate("<<Cut>>"))
+    menu.add_command(label="Copy", command=lambda w=widget: w.event_generate("<<Copy>>"))
+    menu.add_command(label="Paste", command=lambda w=widget: w.event_generate("<<Paste>>"))
+    menu.add_separator()
+    menu.add_command(label="Select All", command=lambda w=widget: w.event_generate("<<SelectAll>>"))
+    try:
+        menu.tk_popup(event.x_root, event.y_root)
+    finally:
+        menu.grab_release()
+
+# Right click for copy and paste
+title_entry.bind("<Button-3>", show_context_menu)
+content_text.bind("<Button-3>", show_context_menu)
 
 # -------------------------------
 # On startup, load notes and populate the sidebar.
