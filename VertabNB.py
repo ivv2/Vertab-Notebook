@@ -69,8 +69,8 @@ if IS_WINDOWS:
     import ctypes
     from ctypes import wintypes
 
-    user32 = ctypes.WinDLL("user32", use_last_error=True)
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32 = core.system_dll("user32.dll", use_last_error=True)
+    kernel32 = core.system_dll("kernel32.dll", use_last_error=True)
 
     GWL_EXSTYLE = -20
     WS_EX_LAYERED = 0x00080000
@@ -123,7 +123,7 @@ def enable_dpi_awareness():
     if not IS_WINDOWS:
         return
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        core.system_dll("shcore.dll").SetProcessDpiAwareness(1)
     except (AttributeError, OSError):
         with contextlib.suppress(AttributeError, OSError):
             user32.SetProcessDPIAware()

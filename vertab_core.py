@@ -81,6 +81,17 @@ def data_dir(portable=False):
     return os.path.join(base, APP_NAME.lower())
 
 
+def system_dll(name, **kwargs):
+    """Load a Windows DLL from System32 only.
+
+    A bare name would also search the executable's folder and the working
+    directory, so a planted same-named DLL could be loaded instead.
+    """
+    import ctypes
+    LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x800
+    return ctypes.WinDLL(name, winmode=LOAD_LIBRARY_SEARCH_SYSTEM32, **kwargs)
+
+
 def instance_name(folder):
     """Mutex name unique to one data folder, so portable copies don't collide."""
     key = os.path.normcase(os.path.abspath(folder)).encode("utf-8", "replace")

@@ -14,12 +14,14 @@ file owns everything visual that is reusable:
 Nothing here touches notes or settings, and nothing imports the app script.
 """
 import contextlib
+import os
 import tkinter as tk
 import tkinter.font as tkfont
 
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 from ttkbootstrap.style import ThemeDefinition
 
+import vertab_core as core
 from vertab_core import IS_WINDOWS
 
 if IS_WINDOWS:
@@ -108,6 +110,7 @@ def register_themes(style):
 # (Windows 10), then Segoe UI Symbol with the plain characters below.
 ICON_FONT_FILES = ("SegoeIcons.ttf", "segmdl2.ttf")
 FALLBACK_FONT_FILES = ("seguisym.ttf", "segoeui.ttf", "DejaVuSans.ttf")
+FONT_DIR = os.path.join(os.environ.get("WINDIR") or r"C:\Windows", "Fonts")
 # name -> (icon font glyph, plain fallback character)
 ICONS = {
     "menu": ("\ue700", "☰"), "add": ("\ue710", "+"), "search": ("\ue721", "⌕"),
@@ -154,8 +157,11 @@ class Look:
     @staticmethod
     def _truetype(files, size):
         for name in files:
+            # Full paths on Windows: given a bare name, Pillow tries the working
+            # directory before the Fonts folder.
+            path = os.path.join(FONT_DIR, name) if IS_WINDOWS else name
             with contextlib.suppress(OSError):
-                return ImageFont.truetype(name, size)
+                return ImageFont.truetype(path, size)
         return None
 
     def _icon_font(self, size):
@@ -250,7 +256,7 @@ def style_native_frame(hwnd, dark):
     if not (IS_WINDOWS and hwnd):
         return
     with contextlib.suppress(OSError, AttributeError):
-        dwm = ctypes.windll.dwmapi
+        dwm = core.system_dll("dwmapi.dll")
         dwm.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD,
                                               ctypes.c_void_p, wintypes.DWORD]
 
@@ -263,7 +269,7 @@ def style_native_frame(hwnd, dark):
                 break
         attribute(33, 2)  # DWMWA_WINDOW_CORNER_PREFERENCE = round (Windows 11 only)
         # A visible window repaints its frame only when its active state flips.
-        user32 = ctypes.windll.user32
+        user32 = core.system_dll("user32.dll")
         user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
         active = user32.GetForegroundWindow() == hwnd
         for state in (not active, active):

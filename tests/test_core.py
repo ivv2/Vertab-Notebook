@@ -175,6 +175,22 @@ class GeometryTests(unittest.TestCase):
         self.assertEqual(core.snap_position(1930, 500, 380, 460, second, 18), (1920, 500))
 
 
+@unittest.skipUnless(core.IS_WINDOWS, "Windows only")
+class SystemDllTests(unittest.TestCase):
+    def test_loads_from_system32(self):
+        self.assertTrue(hasattr(core.system_dll("dwmapi.dll"), "DwmSetWindowAttribute"))
+
+    def test_refuses_dlls_outside_system32(self):
+        with tempfile.TemporaryDirectory() as folder:
+            cwd = os.getcwd()
+            try:
+                os.chdir(folder)
+                with self.assertRaises(OSError):
+                    core.system_dll("not-a-system-dll.dll")
+            finally:
+                os.chdir(cwd)
+
+
 class InstanceNameTests(unittest.TestCase):
     def test_stable_and_folder_specific(self):
         a = core.instance_name(r"C:\Users\x\AppData\Roaming\VerTab")
