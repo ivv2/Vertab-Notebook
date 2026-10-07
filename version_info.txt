@@ -1,0 +1,30 @@
+# PyInstaller version resource for VerTab.exe (File > Properties > Details).
+# An exe with proper version metadata is also less likely to be flagged by
+# antivirus heuristics than an anonymous one.
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 1, 0, 0),
+    prodvers=(1, 1, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable(
+        u'040904B0',
+        [StringStruct(u'CompanyName', u'ivv2'),
+         StringStruct(u'FileDescription', u'VerTab Notebook'),
+         StringStruct(u'FileVersion', u'1.1.0'),
+         StringStruct(u'InternalName', u'VerTab'),
+         StringStruct(u'LegalCopyright', u'ivv2'),
+         StringStruct(u'OriginalFilename', u'VerTab.exe'),
+         StringStruct(u'ProductName', u'VerTab Notebook'),
+         StringStruct(u'ProductVersion', u'1.1.0')])
+    ]),
+    VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
+  ]
+)

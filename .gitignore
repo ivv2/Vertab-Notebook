@@ -371,3 +371,6 @@ FodyWeavers.xsd
 
 # Machine-specific Visual Studio extension settings
 .claudiaideconfig
+
+# Agent worktrees (Claude Code)
+.claude/worktrees/

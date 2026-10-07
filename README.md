@@ -4,10 +4,45 @@ ___ivv2___Vertical__Tab_Notebook
 
 VerTab is a multipourpose notes app with great features like:
 1. Tree-style vertical tabs for easy finding of all the notes,
-2. Easy to understand graphics.
-3. Copy & paste buttons for fast replication of the notes.
-4. **Overlay mode** — float VerTab on top of whatever app you are working in.
-5. A single-file **VerTab.exe** you can run without installing Python.
+2. **Live search** across note titles *and* text,
+3. A **Midnight** look in dark and light, following your Windows setting,
+4. Copy & paste in a right-click menu for fast replication of the notes.
+5. **Overlay mode** — float VerTab on top of whatever app you are working in.
+6. A single-file **VerTab.exe** you can run without installing Python.
+
+## The interface
+
+VerTab uses one design language in two variants, **Midnight** (dark) and
+**Midnight Light**: layered surfaces, hairline borders and a single violet
+accent, with flat icon buttons drawn from the Windows icon font (nothing is
+bundled; plain characters stand in if that font is missing). By default the
+theme is **Match Windows**, which follows your light/dark app setting and
+switches live when you change it; pick a fixed variant in the `☰` menu →
+*Theme*. The choice is remembered.
+
+* **Toolbar** — `☰` menu, the accent **+** for a new note, the note-list toggle
+  and the overlay/window switch. Hover any icon for its name.
+* **Sidebar** — a pill-shaped search box on top, then your notes. The open note
+  is marked with a pill and an accent bar.
+* **Editor** — a large title, then the text. A dot beside the title (and a
+  filled Save button) shows unsaved changes. The Save and Delete buttons sit on
+  the title row.
+* **Editor width** — on wide windows the writing column stops at a comfortable
+  line length and centres, instead of stretching edge to edge.
+* **Status bar** — messages on the left; the open note's word and character
+  count and your note total on the right, always visible (narrow windows drop
+  detail first).
+* **Compact windows** — below about 560 px wide (the default overlay is 380) the
+  note list and the editor take turns instead of sitting side by side: use the
+  list button (or `Ctrl+F`) to bring up the list, and picking a note returns to
+  the editor. Nothing is clipped down to the 320 x 240 minimum.
+
+### Search
+
+Type in the search box (`Ctrl+F` jumps to it) and the list filters as you type,
+matching note titles and text, ignoring case. `Down` moves into the list,
+`Enter` opens the first match, and `Esc` clears the search (it never hides the
+window while you are in the search box).
 
 ---
 
@@ -42,7 +77,7 @@ video, a terminal or a document.
 * **Resize it** — drag the grip in the bottom-right corner.
 * **Roll it up** — double-click the title bar, or use the `–` button.
 * **Menu** — the `☰` button (or right-click the title bar) has opacity, themes,
-  click-through, sidebar and autosave settings.
+  click-through, the note list and autosave settings.
 * **Click-through** — makes the mouse pass straight through VerTab to the app
   underneath, so the notes stay readable without getting in the way. It always
   starts **off**; while it is on, nothing in the window is clickable, so use the
@@ -61,7 +96,8 @@ focus:
 | `Ctrl+Alt+T` | click-through on / off |
 | `Ctrl+Alt+↑` / `Ctrl+Alt+↓` | more / less opaque |
 
-While VerTab is focused: `Ctrl+S` save, `Ctrl+N` new note, `Esc` hide, `F1` info.
+While VerTab is focused: `Ctrl+S` save, `Ctrl+N` new note, `Ctrl+F` search,
+`Esc` clear the search or hide VerTab, `F1` info.
 
 Overlay mode is built on Windows window styles. On macOS and Linux the frameless
 always-on-top panel still works, but click-through, taskbar hiding and the
@@ -80,7 +116,7 @@ anywhere:
 | Linux | `~/.config/vertab/` |
 
 It holds `notes.json` (your notes) and `config.json` (window position, opacity,
-theme and so on). A `notes.json` sitting next to the script is picked up
+theme — `auto`, `midnight` or `midnight-light` — and so on). A `notes.json` sitting next to the script is picked up
 automatically the first time you run this version, so existing notes carry over.
 Use `--portable` to keep both files beside the executable instead.
 
