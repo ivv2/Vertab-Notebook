@@ -1110,6 +1110,13 @@ apply_mode(initial=True)
 start_hotkeys()
 load_into_editor(None)
 
+# --open TITLE opens a note at launch (handy for desktop shortcuts).
+if "--open" in sys.argv[:-1]:
+    requested = sys.argv[sys.argv.index("--open") + 1]
+    if requested in notes:
+        load_into_editor(requested)
+        select_title(requested)
+
 if notes_warning:
     root.after(300, lambda: messagebox.showwarning("Notebook recovered", notes_warning, parent=root))
 elif overlay_mode.get() and IS_WINDOWS:

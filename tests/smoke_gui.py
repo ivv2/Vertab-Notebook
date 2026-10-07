@@ -29,7 +29,11 @@ TRICKY_NOTES = {
 }
 
 
-def windows(title=None, cls=None):
+def windows(title=None, cls=None, pids=None):
+    """Visible top-level windows, optionally only those owned by `pids`.
+
+    Scoping by process lets several copies of this test run side by side.
+    """
     found = []
     proc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
 
@@ -41,6 +45,10 @@ def windows(title=None, cls=None):
         user32.GetWindowTextW(hwnd, text, n + 1)
         name = ctypes.create_unicode_buffer(256)
         user32.GetClassNameW(hwnd, name, 256)
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if pids is not None and owner.value not in pids:
+            return True
         if (title is None or text.value == title) and (cls is None or name.value == cls):
             found.append(hwnd)
         return True
@@ -66,6 +74,9 @@ class Run:
         self.folder = os.path.join(self.appdata, "VerTab")
         os.makedirs(self.folder)
         self.procs = []
+        # The exe re-launches itself as a child process, so only a script
+        # run can be scoped to process ids; the exe is matched by title.
+        self.pids = None if target.endswith(".exe") else set()
 
     def seed(self, raw):
         with open(os.path.join(self.folder, "notes.json"), "w", encoding="utf-8") as f:
@@ -77,7 +88,12 @@ class Run:
         proc = subprocess.Popen(cmd + list(args), cwd=self.appdata, env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.procs.append(proc)
+        if self.pids is not None:
+            self.pids.add(proc.pid)
         return proc
+
+    def windows(self, title=TITLE, cls=None):
+        return windows(title, cls, self.pids)
 
     def close(self):
         for proc in self.procs:
@@ -98,7 +114,7 @@ def main():
         if not ok:
             failures.append(name)
 
-    if windows(TITLE):
+    if target.endswith(".exe") and windows(TITLE):
         print("A VerTab window is already open; close it first.")
         return 2
 
@@ -107,12 +123,12 @@ def main():
     try:
         run.seed(json.dumps(TRICKY_NOTES))
         proc = run.launch("--window")
-        hwnd = wait_for(lambda: windows(TITLE, "TkTopLevel"), timeout)
+        hwnd = wait_for(lambda: run.windows(TITLE, "TkTopLevel"), timeout)
         check("window mode opens", bool(hwnd))
         time.sleep(1.5)
         check("window mode stays running", proc.poll() is None,
               "" if proc.poll() is None else proc.stdout.read().decode(errors="replace")[-600:])
-        check("no error dialog", not windows(cls="#32770"))
+        check("no error dialog", not run.windows(None, "#32770"))
         if hwnd:
             ex = user32.GetWindowLongPtrW(hwnd[0], -20)
             check("window mode is not topmost by default", not ex & WS_EX_TOPMOST)
@@ -120,7 +136,7 @@ def main():
 
         # 2. overlay mode styles
         proc = run.launch("--overlay")
-        hwnd = wait_for(lambda: windows(TITLE, "TkTopLevel"), timeout)
+        hwnd = wait_for(lambda: run.windows(TITLE, "TkTopLevel"), timeout)
         check("overlay mode opens", bool(hwnd))
         if hwnd:
             time.sleep(1.0)
@@ -132,14 +148,14 @@ def main():
 
         # 3. a second instance must refuse to start
         second = run.launch("--overlay")
-        dialog = wait_for(lambda: windows(TITLE, "#32770"), timeout)
-        check("second instance is refused", bool(dialog) and len(windows(TITLE, "TkTopLevel")) == 1)
+        dialog = wait_for(lambda: run.windows(TITLE, "#32770"), timeout)
+        check("second instance is refused", bool(dialog) and len(run.windows(TITLE, "TkTopLevel")) == 1)
         run.close()
 
         # 4. a damaged notebook is moved aside, not overwritten
         run.seed('{"math": "x = 1",')
         proc = run.launch("--window")
-        dialog = wait_for(lambda: windows("Notebook recovered", "#32770"), timeout)
+        dialog = wait_for(lambda: run.windows("Notebook recovered", "#32770"), timeout)
         check("damaged notebook is reported", bool(dialog))
         kept = [n for n in os.listdir(run.folder) if ".damaged-" in n]
         check("damaged notebook is kept aside", len(kept) == 1, ", ".join(kept))
@@ -150,7 +166,7 @@ def main():
             json.dump({"opacity": "lots", "theme": "no-such-theme", "overlay_geometry": "x",
                        "window_geometry": "200x200+99999+99999"}, f)
         proc = run.launch()
-        hwnd = wait_for(lambda: windows(TITLE, "TkTopLevel"), timeout)
+        hwnd = wait_for(lambda: run.windows(TITLE, "TkTopLevel"), timeout)
         check("starts with a hostile config.json", bool(hwnd) and proc.poll() is None)
         if hwnd:
             rect = wintypes.RECT()
