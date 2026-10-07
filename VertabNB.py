@@ -3,15 +3,15 @@
 
 Two ways to run it:
 
-  Window mode   a normal resizable window (what the app always did).
+  Window mode   a normal resizable window.
   Overlay mode  a frameless, always-on-top, semi-transparent panel that sits
                 over whatever you are working in, with global hotkeys so you
                 can show, hide and click through it without leaving the other
                 app.
 
-Notes and settings live in a per-user folder (%APPDATA%\\VerTab on Windows) so
-the packaged executable keeps working wherever it is started from.  Pass
---portable to keep them next to the executable instead.
+Notes and settings live in a per-user folder (%APPDATA%\\VerTab on Windows);
+see vertab_core.py for how they are stored safely.  Pass --portable to keep
+them next to the executable instead.
 
 Hotkeys (global on Windows -- they work while another app is focused):
   Ctrl+Alt+N    show / hide VerTab
@@ -19,161 +19,60 @@ Hotkeys (global on Windows -- they work while another app is focused):
   Ctrl+Alt+T    click-through on / off
   Ctrl+Alt+Up   more opaque        Ctrl+Alt+Down  more transparent
 """
-import json
-import os
+import contextlib
 import queue
-import shutil
 import sys
 import threading
+import traceback
 import tkinter as tk
 from tkinter import ttk, messagebox
 
 from ttkbootstrap import Style
 
-APP_NAME = "VerTab"
+import vertab_core as core
+from vertab_core import IS_WINDOWS
+
+APP_NAME = core.APP_NAME
 APP_TITLE = "VerTab Notebook"
-NOTES_FILE = "notes.json"
-CONFIG_FILE = "config.json"
 
-IS_WINDOWS = sys.platform == "win32"
-FROZEN = getattr(sys, "frozen", False)
-
-MIN_WIDTH, MIN_HEIGHT = 320, 240
-SNAP_DISTANCE = 18          # px from a screen edge before the overlay snaps to it
-MIN_OPACITY, MAX_OPACITY = 0.25, 1.0
+SNAP_DISTANCE = 18          # px from a work-area edge before the overlay snaps to it
 OPACITY_STEP = 0.05
+# Click-through needs a layered window, and Tk only keeps the window layered
+# while alpha is below 1 -- at exactly 1.0 a click-through overlay can vanish.
+CLICK_THROUGH_MAX_ALPHA = 0.99
 
 # Global dictionary for notes and a variable for current note title.
 notes = {}
 current_note_title = None
-dirty = False               # editor has unsaved edits
+dirty = False               # editor has edits that are not on disk
+
+# Treeview item ids are generated, never note titles: a title such as "{oops"
+# is not a valid Tcl list element and would crash tree.selection().
+iid_by_title = {}
+title_by_iid = {}
+
+storage = core.Storage(core.data_dir(portable="--portable" in sys.argv))
 
 # -------------------------------
-# Where things are stored
+# Windows API
 # -------------------------------
-# A frozen executable can be launched from anywhere, so "notes.json" relative
-# to the working directory is not good enough -- resolve real paths up front.
-
-portable = "--portable" in sys.argv
-
-
-def app_dir():
-    """Folder the app lives in (the executable's folder when frozen)."""
-    if FROZEN:
-        return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.abspath(__file__))
-
-
-def resource_path(*parts):
-    """Path to a bundled read-only resource (handles the PyInstaller bundle)."""
-    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, *parts)
-
-
-def data_dir():
-    """Folder holding notes.json and config.json."""
-    if portable:
-        return app_dir()
-    if IS_WINDOWS:
-        base = os.environ.get("APPDATA") or os.path.expanduser("~")
-        return os.path.join(base, APP_NAME)
-    if sys.platform == "darwin":
-        return os.path.join(os.path.expanduser("~"), "Library", "Application Support", APP_NAME)
-    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
-    return os.path.join(base, APP_NAME.lower())
-
-
-def data_path(name):
-    return os.path.join(data_dir(), name)
-
-
-def prepare_data_dir():
-    """Create the data folder and adopt a notes.json left next to the script."""
-    os.makedirs(data_dir(), exist_ok=True)
-    target = data_path(NOTES_FILE)
-    legacy = os.path.join(app_dir(), NOTES_FILE)
-    if not os.path.exists(target) and os.path.exists(legacy):
-        if os.path.abspath(legacy) != os.path.abspath(target):
-            shutil.copy2(legacy, target)
-
-
-# -------------------------------
-# Notes + settings on disk
-# -------------------------------
-DEFAULT_CONFIG = {
-    "overlay_mode": False,
-    "topmost": True,
-    "opacity": 0.92,
-    "theme": "journal",
-    "window_geometry": "700x500",
-    "overlay_geometry": "",
-    "sidebar_visible": True,
-    "hide_from_taskbar": True,
-    "autosave": True,
-}
-
-config = dict(DEFAULT_CONFIG)
-
-
-# Load saved notes from JSON.
-def load_notes_from_file():
-    global notes
-    try:
-        with open(data_path(NOTES_FILE), "r", encoding="utf-8") as f:
-            notes = json.load(f)
-    except (FileNotFoundError, ValueError):
-        notes = {}
-
-
-# Save notes dictionary to file.
-def save_notes_to_file():
-    with open(data_path(NOTES_FILE), "w", encoding="utf-8") as f:
-        json.dump(notes, f, indent=4, ensure_ascii=False)
-
-
-def load_config():
-    global config
-    config = dict(DEFAULT_CONFIG)
-    try:
-        with open(data_path(CONFIG_FILE), "r", encoding="utf-8") as f:
-            saved = json.load(f)
-        if isinstance(saved, dict):
-            config.update({k: v for k, v in saved.items() if k in DEFAULT_CONFIG})
-    except (FileNotFoundError, ValueError):
-        pass
-    # Command line wins over the saved mode.
-    if "--overlay" in sys.argv:
-        config["overlay_mode"] = True
-    if "--window" in sys.argv:
-        config["overlay_mode"] = False
-
-
-def save_config():
-    try:
-        with open(data_path(CONFIG_FILE), "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=4)
-    except OSError:
-        pass  # settings are a convenience; never block the app on them
-
-
-# -------------------------------
-# Windows window-style helpers
-# -------------------------------
-# Click-through, no-activate and hiding from the taskbar are not exposed by
-# Tk, so they are set straight on the window's extended style.  Everything in
-# this section is a no-op off Windows.
+# Click-through, no-activate, taskbar hiding, monitor work areas, DPI and the
+# single-instance mutex are not exposed by Tk.  Everything that uses this is
+# a no-op off Windows.
 if IS_WINDOWS:
     import ctypes
     from ctypes import wintypes
 
-    user32 = ctypes.windll.user32
-    kernel32 = ctypes.windll.kernel32
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
     GWL_EXSTYLE = -20
     WS_EX_LAYERED = 0x00080000
     WS_EX_TRANSPARENT = 0x00000020
     WS_EX_NOACTIVATE = 0x08000000
     WS_EX_TOOLWINDOW = 0x00000080
+    MONITOR_DEFAULTTONEAREST = 2
+    ERROR_ALREADY_EXISTS = 183
 
     if ctypes.sizeof(ctypes.c_void_p) == 8:
         _get_long = user32.GetWindowLongPtrW
@@ -188,11 +87,74 @@ if IS_WINDOWS:
     _set_long.restype = _long
     _set_long.argtypes = [wintypes.HWND, ctypes.c_int, _long]
 
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                    ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+    user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+    user32.MonitorFromPoint.restype = wintypes.HANDLE
+    user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MONITORINFO)]
+    user32.GetMonitorInfoW.restype = wintypes.BOOL
+    user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+    user32.RegisterHotKey.restype = wintypes.BOOL
+    user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                                   wintypes.UINT, wintypes.UINT]
+    user32.GetMessageW.restype = wintypes.BOOL
+    user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT,
+                                          wintypes.WPARAM, wintypes.LPARAM]
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+
+
+def enable_dpi_awareness():
+    """Render crisply on scaled displays instead of being bitmap-stretched.
+
+    System-aware rather than per-monitor: Tk 8.6 does not handle
+    WM_DPICHANGED, so per-monitor awareness would leave it mis-sized when
+    dragged between monitors with different scaling.
+    """
+    if not IS_WINDOWS:
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except (AttributeError, OSError):
+        with contextlib.suppress(AttributeError, OSError):
+            user32.SetProcessDPIAware()
+
+
+instance_lock = None
+
+
+def acquire_instance_lock():
+    """One VerTab per notebook -- two would overwrite each other's saves."""
+    global instance_lock
+    if IS_WINDOWS:
+        ctypes.set_last_error(0)
+        instance_lock = kernel32.CreateMutexW(None, False, core.instance_name(storage.folder))
+        return ctypes.get_last_error() != ERROR_ALREADY_EXISTS
+    import fcntl
+    try:
+        instance_lock = open(storage.path(".lock"), "w")
+        fcntl.flock(instance_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def show_startup_message(kind, message):
+    """Report something before the main window exists, then let the caller exit."""
+    temp = tk.Tk()
+    temp.withdraw()
+    if kind == "error":
+        messagebox.showerror(APP_TITLE, message, parent=temp)
+    else:
+        messagebox.showinfo(APP_TITLE, message, parent=temp)
+    temp.destroy()
+
 
 def window_handle():
     """HWND of the real top-level window (not Tk's inner child window)."""
-    if not IS_WINDOWS:
-        return None
     try:
         return int(root.wm_frame(), 16)
     except (ValueError, tk.TclError):
@@ -200,14 +162,34 @@ def window_handle():
 
 
 def update_ex_style(add=0, remove=0):
-    """Add/remove extended window style bits; returns the new style."""
+    """Add/remove extended window style bits."""
     if not IS_WINDOWS:
-        return 0
+        return
     hwnd = window_handle()
-    style_bits = _get_long(hwnd, GWL_EXSTYLE)
-    style_bits = (style_bits | add) & ~remove
+    style_bits = (_get_long(hwnd, GWL_EXSTYLE) | add) & ~remove
     _set_long(hwnd, GWL_EXSTYLE, _long(style_bits))
-    return style_bits
+
+
+def work_area_at(x, y):
+    """(left, top, right, bottom) of the usable desktop on the monitor nearest
+    to (x, y) -- excludes the taskbar, and follows multi-monitor layouts."""
+    if IS_WINDOWS:
+        monitor = user32.MonitorFromPoint(wintypes.POINT(int(x), int(y)), MONITOR_DEFAULTTONEAREST)
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(MONITORINFO)
+        if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            r = info.rcWork
+            return r.left, r.top, r.right, r.bottom
+    return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
+
+
+def on_screen(geometry):
+    """Clamp a saved geometry onto the monitor it is closest to."""
+    match = core.POSITIONED_RE.match(geometry or "")
+    if not match:
+        return geometry
+    w, h, x, y = (int(v) for v in match.groups())
+    return core.clamp_geometry(geometry, work_area_at(x + w // 2, y + h // 2))
 
 
 def apply_taskbar_visibility():
@@ -231,6 +213,7 @@ def apply_click_through():
     """Let mouse clicks fall through to the app underneath."""
     if not IS_WINDOWS:
         return
+    refresh_alpha()  # first, so Tk has made the window layered
     if click_through.get():
         update_ex_style(add=WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE)
     else:
@@ -276,23 +259,28 @@ class HotkeyThread(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True, name="vertab-hotkeys")
         self.thread_id = None
-        self.registered = []
+        self.active = set()             # names that registered successfully
+        self.ready = threading.Event()  # set once registration has been tried
 
     def run(self):
-        self.thread_id = kernel32.GetCurrentThreadId()
         ids = {}
-        for index, (name, (mods, vk, _label)) in enumerate(GLOBAL_HOTKEYS.items(), start=1):
-            if user32.RegisterHotKey(None, index, mods | MOD_NOREPEAT, vk):
-                ids[index] = name
-                self.registered.append(index)
-        msg = wintypes.MSG()
-        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            if msg.message == WM_HOTKEY:
-                name = ids.get(msg.wParam)
-                if name:
-                    HOTKEY_QUEUE.put(name)
-        for index in self.registered:
-            user32.UnregisterHotKey(None, index)
+        try:
+            self.thread_id = kernel32.GetCurrentThreadId()
+            for index, (name, (mods, vk, _label)) in enumerate(GLOBAL_HOTKEYS.items(), start=1):
+                if user32.RegisterHotKey(None, index, mods | MOD_NOREPEAT, vk):
+                    ids[index] = name
+                    self.active.add(name)
+            self.ready.set()
+            msg = wintypes.MSG()
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                if msg.message == WM_HOTKEY and msg.wParam in ids:
+                    HOTKEY_QUEUE.put(ids[msg.wParam])
+        except Exception:  # a dead hotkey thread must not take the app down
+            storage.log("hotkey thread failed:\n" + traceback.format_exc())
+        finally:
+            self.ready.set()
+            for index in ids:
+                user32.UnregisterHotKey(None, index)
 
     def stop(self):
         if self.thread_id:
@@ -307,7 +295,22 @@ def start_hotkeys():
     if IS_WINDOWS and hotkey_thread is None:
         hotkey_thread = HotkeyThread()
         hotkey_thread.start()
+        root.after(300, report_hotkey_conflicts)
         poll_hotkeys()
+
+
+def hotkey_available(name):
+    return bool(hotkey_thread and hotkey_thread.ready.is_set() and name in hotkey_thread.active)
+
+
+def report_hotkey_conflicts():
+    if not hotkey_thread.ready.is_set():
+        root.after(200, report_hotkey_conflicts)
+        return
+    taken = [GLOBAL_HOTKEYS[n][2] for n in GLOBAL_HOTKEYS if n not in hotkey_thread.active]
+    if taken:
+        storage.log("hotkeys already in use by another app: " + ", ".join(taken))
+        set_status("In use by another app: " + ", ".join(taken), clear_after=8000)
 
 
 def poll_hotkeys():
@@ -320,7 +323,7 @@ def poll_hotkeys():
         action = HOTKEY_ACTIONS.get(name)
         if action:
             action()
-    root.after(80, poll_hotkeys)
+    root.after(100, poll_hotkeys)
 
 
 # -------------------------------
@@ -329,111 +332,184 @@ def poll_hotkeys():
 # Update the sidebar Treeview with the note titles.
 def update_treeview():
     tree.delete(*tree.get_children())
-    for title in sorted(notes.keys()):
-        tree.insert("", tk.END, iid=title, text=title)
+    iid_by_title.clear()
+    title_by_iid.clear()
+    for title in sorted(notes, key=str.casefold):
+        iid = tree.insert("", tk.END, text=title)
+        iid_by_title[title] = iid
+        title_by_iid[iid] = title
+
+
+def select_title(title):
+    """Highlight a note in the sidebar (or clear the highlight for None)."""
+    iid = iid_by_title.get(title)
+    if iid:
+        tree.selection_set(iid)
+        tree.see(iid)
+    else:
+        tree.selection_remove(tree.selection())
+
+
+def load_into_editor(title):
+    global current_note_title
+    current_note_title = title
+    title_var.set(title or "")
+    content_text.delete("1.0", tk.END)
+    if title is not None:
+        content_text.insert(tk.END, notes.get(title, ""))
+    content_text.edit_reset()  # undo history must not cross notes
+    mark_clean()
 
 
 # When a note is selected in the sidebar, load it into the editor.
 def on_tree_select(event):
-    global current_note_title
     selected = tree.selection()
     if not selected:
         return
-    title = selected[0]
-    if title == current_note_title:
+    title = title_by_iid.get(selected[0])
+    if title is None or title == current_note_title:
         return
-    autosave_current()
-    current_note_title = title
-    # Set the two editor fields.
-    title_entry.delete(0, tk.END)
-    title_entry.insert(0, title)
-    content_text.delete("1.0", tk.END)
-    content_text.insert(tk.END, notes.get(title, ""))
-    mark_clean()
+    if not resolve_unsaved("open another note"):
+        select_title(current_note_title)
+        return
+    load_into_editor(title)
+    select_title(title)
 
 
 # Create a new (empty) note to edit.
 def new_note(event=None):
-    global current_note_title
-    autosave_current()
-    current_note_title = None
-    title_entry.delete(0, tk.END)
-    content_text.delete("1.0", tk.END)
-    # Also clear Treeview selection.
-    tree.selection_remove(tree.selection())
-    title_entry.focus_set()
-    mark_clean()
+    if resolve_unsaved("start a new note"):
+        load_into_editor(None)
+        select_title(None)
+        title_entry.focus_set()
     return "break"
+
+
+def commit_note(title, content):
+    """Write one note to disk. Returns False (and keeps the edits) on failure."""
+    global current_note_title
+    before = dict(notes)
+    renamed = current_note_title is not None and current_note_title != title
+    if renamed:
+        notes.pop(current_note_title, None)
+    added = title not in notes
+    notes[title] = content
+    try:
+        storage.save_notes(notes)
+    except core.NotebookError as exc:
+        notes.clear()
+        notes.update(before)  # memory must keep matching what is on disk
+        messagebox.showerror("Not saved", str(exc), parent=root)
+        return False
+    current_note_title = title
+    if renamed or added:
+        update_treeview()
+    select_title(title)
+    mark_clean()
+    return True
 
 
 # Save/update the current note.
 def save_note(event=None):
-    global current_note_title
-    title = title_entry.get().strip()
-    content = content_text.get("1.0", tk.END).rstrip()
+    title = title_var.get().strip()
     if not title:
         messagebox.showerror("Error", "Title cannot be empty!", parent=root)
         return "break"
-
-    # If renaming an existing note, remove the old key.
-    if current_note_title and current_note_title != title:
-        notes.pop(current_note_title, None)
-
-    notes[title] = content
-    current_note_title = title
-    save_notes_to_file()
-    update_treeview()
-    # Optionally, select the updated note in the sidebar.
-    tree.selection_set(title)
-    mark_clean()
-    set_status("Saved “%s”" % title)
+    if title != current_note_title and title in notes:
+        replace = messagebox.askyesno(
+            "Replace Note",
+            "A note named “%s” already exists.\n\nReplace it with this one?" % title,
+            icon="warning", parent=root,
+        )
+        if not replace:
+            return "break"
+    if commit_note(title, content_text.get("1.0", "end-1c").rstrip()):
+        set_status("Saved “%s”" % title)
     return "break"
 
 
 # Delete the currently loaded note.
 def delete_note():
-    global current_note_title
-    if not current_note_title:
+    if current_note_title is None:
         messagebox.showerror("Error", "No note selected to delete!", parent=root)
         return
     confirm = messagebox.askyesno(
         "Delete Note",
-        "Are you sure you want to delete '%s'?" % current_note_title,
-        parent=root,
+        "Are you sure you want to delete “%s”?" % current_note_title,
+        icon="warning", parent=root,
     )
-    if confirm:
-        notes.pop(current_note_title, None)
-        save_notes_to_file()
-        update_treeview()
-        mark_clean()
-        new_note()  # clear the editor
+    if not confirm:
+        return
+    removed = notes.pop(current_note_title)
+    try:
+        storage.save_notes(notes)
+    except core.NotebookError as exc:
+        notes[current_note_title] = removed
+        messagebox.showerror("Not deleted", str(exc), parent=root)
+        return
+    update_treeview()
+    load_into_editor(None)  # clear the editor
 
 
-def mark_dirty(event=None):
+def can_save_as(title):
+    """A title can be saved without clobbering a different note."""
+    return bool(title) and (title == current_note_title or title not in notes)
+
+
+def resolve_unsaved(action):
+    """Before the editor is replaced: save, discard or cancel. True = go ahead."""
+    if not dirty:
+        return True
+    title = title_var.get().strip()
+    text = content_text.get("1.0", "end-1c").rstrip()
+    if not title and not text.strip():
+        return True  # an empty draft has nothing to lose
+    if can_save_as(title) and config["autosave"]:
+        return commit_note(title, text)
+
+    if not title:
+        problem = "This note has no title yet, so it can't be saved."
+    elif not can_save_as(title):
+        problem = "Another note is already called “%s”." % title
+    else:
+        problem = "This note has unsaved changes."
+    if can_save_as(title):
+        answer = messagebox.askyesnocancel(
+            "Unsaved changes", "%s\n\nSave it before you %s?" % (problem, action), parent=root)
+        if answer is None:
+            return False
+        return commit_note(title, text) if answer else True
+    return messagebox.askokcancel(
+        "Unsaved changes", "%s\n\nDiscard it and %s?" % (problem, action),
+        icon="warning", parent=root)
+
+
+def quiet_autosave():
+    """Save without asking anything -- used when the overlay is hidden."""
+    if dirty and config["autosave"]:
+        title = title_var.get().strip()
+        if can_save_as(title):
+            commit_note(title, content_text.get("1.0", "end-1c").rstrip())
+
+
+def on_text_modified(event=None):
+    # <<Modified>> is queued, so it can arrive after mark_clean(); trust the
+    # widget's flag, not the event, to decide whether anything changed.
+    global dirty
+    if content_text.edit_modified():
+        dirty = True
+        content_text.edit_modified(False)
+
+
+def on_title_changed(*_args):
     global dirty
     dirty = True
-    content_text.edit_modified(False)
 
 
 def mark_clean():
     global dirty
     dirty = False
     content_text.edit_modified(False)
-
-
-def autosave_current():
-    """Quietly persist the open note -- used when hiding, switching or quitting."""
-    if not (config["autosave"] and dirty):
-        return
-    title = title_entry.get().strip()
-    if not title:
-        return
-    content = content_text.get("1.0", tk.END).rstrip()
-    if current_note_title and current_note_title != title:
-        notes.pop(current_note_title, None)
-    notes[title] = content
-    save_notes_to_file()
-    mark_clean()
 
 
 # Info button popup
@@ -450,36 +526,81 @@ def show_info():
         "Hotkeys%s:" % ("" if IS_WINDOWS else " (while VerTab is focused)"),
     ]
     for name, (_mods, _vk, label) in GLOBAL_HOTKEYS.items():
-        lines.append("  %-14s %s" % (label, HOTKEY_HELP[name]))
+        taken = IS_WINDOWS and hotkey_thread and hotkey_thread.ready.is_set() \
+            and name not in hotkey_thread.active
+        lines.append("  %-14s %s%s" % (label, HOTKEY_HELP[name],
+                                       "  (in use by another app)" if taken else ""))
     lines += [
         "  %-14s %s" % ("Ctrl+S", "save the open note"),
         "  %-14s %s" % ("Ctrl+N", "new note"),
         "  %-14s %s" % ("Esc", "hide the overlay"),
         "",
         "Notes are stored in:",
-        "  " + data_path(NOTES_FILE),
+        "  " + storage.path(core.NOTES_FILE),
     ]
     messagebox.showinfo("Info", "\n".join(lines), parent=root)
 
 
 # -------------------------------
-# Create the main window
+# Startup checks (before any window)
 # -------------------------------
-prepare_data_dir()
-load_config()
-
-root = tk.Tk()
-root.title(APP_TITLE)
-root.minsize(MIN_WIDTH, MIN_HEIGHT)
-root.withdraw()  # stay hidden until the mode is applied, to avoid a flash
-
-# Use ttkbootstrap style.
-style = Style(theme=config["theme"])
+enable_dpi_awareness()
 
 try:
-    root.iconbitmap(resource_path("assets", "vertab.ico"))
-except (tk.TclError, OSError):
-    pass  # icon is cosmetic; a missing file must not stop the app
+    storage.prepare(legacy_dir=core.app_dir())
+except OSError as exc:
+    show_startup_message("error", "VerTab cannot use its data folder:\n%s\n\n%s"
+                         % (storage.folder, exc))
+    sys.exit(1)
+
+if not acquire_instance_lock():
+    show_startup_message("info", "VerTab is already running.\n\n%s" % (
+        "Press Ctrl+Alt+N to show it." if IS_WINDOWS else "Switch to the open VerTab window."))
+    sys.exit(0)
+
+config = storage.load_config(sys.argv)
+notes, notes_warning = storage.load_notes()
+
+# -------------------------------
+# Create the main window
+# -------------------------------
+root = tk.Tk()
+root.withdraw()  # stay hidden until the mode is applied, to avoid a flash
+root.title(APP_TITLE)
+
+# Geometry is in physical pixels once DPI-aware; scale designed sizes by DPI.
+SCALE = max(1.0, root.winfo_fpixels("1i") / 96.0)
+
+
+def px(value):
+    return int(round(value * SCALE))
+
+
+root.minsize(px(320), px(240))
+
+
+def report_error(exc_type, exc, tb):
+    """Tk callback errors: the windowed exe has no console, so log and show."""
+    storage.log("".join(traceback.format_exception(exc_type, exc, tb)))
+    messagebox.showerror("Unexpected error", "%s\n\nDetails were written to:\n%s"
+                         % (exc, storage.path(core.LOG_FILE)), parent=root)
+
+
+root.report_callback_exception = report_error
+
+# Use ttkbootstrap style.
+style = Style()
+try:
+    style.theme_use(config["theme"])
+except Exception:  # unknown or broken theme name in config.json
+    config["theme"] = core.DEFAULT_CONFIG["theme"]
+    style.theme_use(config["theme"])
+
+with contextlib.suppress(tk.TclError, OSError):  # icon is cosmetic
+    if IS_WINDOWS:
+        root.iconbitmap(default=core.resource_path("assets", "vertab.ico"))
+    else:
+        root.iconphoto(True, tk.PhotoImage(file=core.resource_path("assets", "vertab.png")))
 
 overlay_mode = tk.BooleanVar(value=config["overlay_mode"])
 topmost = tk.BooleanVar(value=config["topmost"])
@@ -487,6 +608,7 @@ click_through = tk.BooleanVar(value=False)  # always starts off, see README
 sidebar_visible = tk.BooleanVar(value=config["sidebar_visible"])
 hide_from_taskbar = tk.BooleanVar(value=config["hide_from_taskbar"])
 autosave_enabled = tk.BooleanVar(value=config["autosave"])
+title_var = tk.StringVar()
 opacity = config["opacity"]
 
 # Custom title bar -- only shown in overlay mode, where the OS frame is gone.
@@ -507,6 +629,16 @@ window_button.pack(side=tk.RIGHT, padx=(0, 4))
 collapse_button = ttk.Button(titlebar, text="–", width=3, style="secondary.TButton")
 collapse_button.pack(side=tk.RIGHT, padx=(0, 4))
 
+# Status strip along the bottom: short messages plus the overlay resize grip.
+# Packed before the body so it is never squeezed out when the window shrinks.
+statusbar = ttk.Frame(root, padding=(8, 2))
+statusbar.pack(side=tk.BOTTOM, fill=tk.X)
+
+status_label = ttk.Label(statusbar, text="", font=("TkDefaultFont", 8))
+status_label.pack(side=tk.LEFT)
+
+grip = ttk.Sizegrip(statusbar)
+
 # Body holds the two original frames:
 #   sidebar_frame for the note titles in a Treeview,
 #   editor_frame for editing note content.
@@ -523,7 +655,7 @@ editor_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 sidebar_label = ttk.Label(sidebar_frame, text="Saved Notes", font=("TkDefaultFont", 12, "bold"))
 sidebar_label.pack(pady=(0, 5))
 
-tree = ttk.Treeview(sidebar_frame, show="tree", height=20)
+tree = ttk.Treeview(sidebar_frame, show="tree", height=20, selectmode="browse")
 tree.pack(fill=tk.Y, expand=True)
 
 # Bind selection event to load note.
@@ -533,7 +665,7 @@ tree.bind("<<TreeviewSelect>>", on_tree_select)
 title_label = ttk.Label(editor_frame, text="Title:")
 title_label.grid(row=0, column=0, padx=5, pady=5, sticky="W")
 
-title_entry = ttk.Entry(editor_frame, width=50)
+title_entry = ttk.Entry(editor_frame, width=50, textvariable=title_var)
 title_entry.grid(row=0, column=1, padx=5, pady=5, sticky="EW")
 
 content_label = ttk.Label(editor_frame, text="Content:")
@@ -563,15 +695,6 @@ save_button.pack(side=tk.LEFT, padx=(0, 5))
 
 delete_button = ttk.Button(button_frame, text="Delete", command=delete_note, style="primary.TButton")
 delete_button.pack(side=tk.LEFT)
-
-# Status strip along the bottom: short messages plus the overlay resize grip.
-statusbar = ttk.Frame(root, padding=(8, 2))
-statusbar.pack(side=tk.BOTTOM, fill=tk.X)
-
-status_label = ttk.Label(statusbar, text="", font=("TkDefaultFont", 8))
-status_label.pack(side=tk.LEFT)
-
-grip = ttk.Sizegrip(statusbar)
 
 
 def set_status(text, clear_after=2500):
@@ -608,8 +731,13 @@ content_text.bind("<Button-3>", show_context_menu)
 def apply_theme(name=None):
     """Switch the ttk theme and restyle the plain tk widgets to match."""
     if name and name != style.theme.name:
-        style.theme_use(name)
+        try:
+            style.theme_use(name)
+        except Exception as exc:
+            set_status("Theme unavailable: %s" % exc)
+            return
         config["theme"] = name
+        schedule_config_save()
     colors = style.colors
     content_text.configure(
         background=colors.inputbg, foreground=colors.inputfg,
@@ -621,11 +749,22 @@ def apply_theme(name=None):
     root.configure(background=colors.bg)
 
 
+def effective_alpha():
+    if not overlay_mode.get():
+        return 1.0  # opacity is an overlay affordance; a normal window stays solid
+    if click_through.get():
+        return min(opacity, CLICK_THROUGH_MAX_ALPHA)
+    return opacity
+
+
+def refresh_alpha():
+    root.attributes("-alpha", effective_alpha())
+
+
 def set_opacity(value, announce=True):
     global opacity
-    opacity = max(MIN_OPACITY, min(MAX_OPACITY, round(value, 2)))
-    # Opacity is an overlay affordance; a normal window stays solid.
-    root.attributes("-alpha", opacity if overlay_mode.get() else 1.0)
+    opacity = max(core.MIN_OPACITY, min(core.MAX_OPACITY, round(value, 2)))
+    refresh_alpha()
     config["opacity"] = opacity
     if announce and overlay_mode.get():
         set_status("Opacity %d%%" % round(opacity * 100))
@@ -633,49 +772,59 @@ def set_opacity(value, announce=True):
 
 
 def nudge_opacity(delta):
-    if not overlay_mode.get():
-        return
-    set_opacity(opacity + delta)
+    if overlay_mode.get():
+        set_opacity(opacity + delta)
 
 
 def apply_topmost():
-    root.attributes("-topmost", bool(topmost.get()))
+    """The overlay is always on top; the window only when asked to."""
+    root.attributes("-topmost", True if overlay_mode.get() else bool(topmost.get()))
     config["topmost"] = bool(topmost.get())
     schedule_config_save()
 
 
 def default_overlay_geometry():
-    """Top-right corner of the screen, a comfortable panel size."""
-    width, height = 380, 460
-    x = max(0, root.winfo_screenwidth() - width - 24)
-    return "%dx%d+%d+%d" % (width, height, x, 48)
+    """Top-right corner of the primary monitor, a comfortable panel size."""
+    left, top, right, _bottom = work_area_at(0, 0)
+    width, height = px(380), px(460)
+    return "%dx%d+%d+%d" % (width, height, max(left, right - width - px(24)), top + px(48))
+
+
+def default_window_geometry():
+    left, top, right, bottom = work_area_at(0, 0)
+    width = min(px(760), right - left)
+    height = min(px(520), bottom - top)
+    return "%dx%d+%d+%d" % (width, height, left + (right - left - width) // 2,
+                            top + (bottom - top - height) // 2)
 
 
 def apply_mode(initial=False):
     """Switch between the frameless overlay and the normal window."""
     on = overlay_mode.get()
     if not initial:
-        # Remember where the mode we are leaving had its window.
-        remember_geometry()
+        expand_if_collapsed()
+        # overlay_mode has already flipped: the current geometry belongs to
+        # the mode we are leaving.
+        remember_geometry(overlay=not on)
+    if not on:
+        click_through.set(False)  # click-through only makes sense on the overlay
 
     root.withdraw()
     root.overrideredirect(on)
 
     if on:
-        titlebar.pack(side=tk.TOP, fill=tk.X, before=body)
+        slaves = root.pack_slaves()
+        titlebar.pack(side=tk.TOP, fill=tk.X, **({"before": slaves[0]} if slaves else {}))
         grip.pack(side=tk.RIGHT)
-        root.geometry(config["overlay_geometry"] or default_overlay_geometry())
-        root.attributes("-alpha", opacity)
-        root.attributes("-topmost", True)
-        topmost.set(True)
+        root.geometry(on_screen(config["overlay_geometry"]) or default_overlay_geometry())
     else:
         titlebar.pack_forget()
         grip.pack_forget()
-        root.geometry(config["window_geometry"] or "700x500")
-        root.attributes("-alpha", 1.0)
-        root.attributes("-topmost", bool(topmost.get()))
+        root.geometry(on_screen(config["window_geometry"]) or default_window_geometry())
 
     config["overlay_mode"] = on
+    apply_topmost()
+    refresh_alpha()
     root.deiconify()
     apply_taskbar_visibility()
     apply_click_through()
@@ -693,14 +842,24 @@ def toggle_overlay_mode():
 
 def toggle_click_through():
     if not IS_WINDOWS:
+        click_through.set(False)
         messagebox.showinfo("Click-through", "Click-through is only available on Windows.",
                             parent=root)
+        return
+    if click_through.get() and not overlay_mode.get():
         click_through.set(False)
+        set_status("Click-through works in overlay mode")
+        return
+    if click_through.get() and not hotkey_available("toggle_click_through"):
+        # Without its hotkey there would be no way to click the window again.
+        click_through.set(False)
+        set_status("Click-through needs the %s hotkey, which another app is using"
+                   % GLOBAL_HOTKEYS["toggle_click_through"][2], clear_after=6000)
         return
     apply_click_through()
     if click_through.get():
-        label = GLOBAL_HOTKEYS["toggle_click_through"][2]
-        set_status("Click-through on — %s to turn it off" % label, clear_after=4000)
+        set_status("Click-through on — %s to turn it off"
+                   % GLOBAL_HOTKEYS["toggle_click_through"][2], clear_after=4000)
     else:
         set_status("Click-through off")
 
@@ -723,13 +882,21 @@ def toggle_visible():
             root.focus_force()
             content_text.focus_set()
     else:
-        autosave_current()
+        quiet_autosave()
         root.withdraw()
 
 
 def hide_window(event=None):
-    autosave_current()
-    root.withdraw()
+    """Esc / Hide. Only withdraw when the global hotkey can bring VerTab back;
+    otherwise a hidden window (with no taskbar entry) would be unreachable."""
+    if overlay_mode.get():
+        if hotkey_available("toggle_visible"):
+            quiet_autosave()
+            root.withdraw()
+        else:
+            toggle_collapse()  # overrideredirect windows cannot be minimised
+    else:
+        root.iconify()
     return "break"
 
 
@@ -743,9 +910,8 @@ def start_move(event):
 
 
 def do_move(event):
-    if not overlay_mode.get():
-        return
-    root.geometry("+%d+%d" % (event.x_root - drag_origin["x"], event.y_root - drag_origin["y"]))
+    if overlay_mode.get():
+        root.geometry("+%d+%d" % (event.x_root - drag_origin["x"], event.y_root - drag_origin["y"]))
 
 
 def end_move(event):
@@ -757,18 +923,10 @@ def end_move(event):
 
 
 def snap_to_edges():
-    """Pull the overlay flush to a screen edge when it is dropped near one."""
+    """Pull the overlay flush to an edge of its monitor's work area."""
     x, y = root.winfo_x(), root.winfo_y()
     w, h = root.winfo_width(), root.winfo_height()
-    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-    if abs(x) <= SNAP_DISTANCE:
-        x = 0
-    elif abs(sw - (x + w)) <= SNAP_DISTANCE:
-        x = sw - w
-    if abs(y) <= SNAP_DISTANCE:
-        y = 0
-    elif abs(sh - (y + h)) <= SNAP_DISTANCE:
-        y = sh - h
+    x, y = core.snap_position(x, y, w, h, work_area_at(x + w // 2, y + h // 2), px(SNAP_DISTANCE))
     root.geometry("+%d+%d" % (x, y))
 
 
@@ -781,11 +939,9 @@ def toggle_collapse():
         root.iconify()
         return
     if collapsed["on"]:
-        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        statusbar.pack(side=tk.BOTTOM, fill=tk.X)
-        root.geometry("%dx%d" % (root.winfo_width(), collapsed["height"]))
-        collapsed["on"] = False
+        expand_if_collapsed()
     else:
+        remember_geometry()
         collapsed["height"] = root.winfo_height()
         body.pack_forget()
         statusbar.pack_forget()
@@ -794,14 +950,21 @@ def toggle_collapse():
         collapsed["on"] = True
 
 
-def remember_geometry():
-    if collapsed["on"]:
+def expand_if_collapsed():
+    if not collapsed["on"]:
         return
-    geometry = root.geometry()
-    if overlay_mode.get():
-        config["overlay_geometry"] = geometry
-    else:
-        config["window_geometry"] = geometry
+    statusbar.pack(side=tk.BOTTOM, fill=tk.X)
+    body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+    root.geometry("%dx%d" % (root.winfo_width(), collapsed["height"]))
+    collapsed["on"] = False
+
+
+def remember_geometry(overlay=None):
+    if collapsed["on"] or root.state() in ("withdrawn", "iconic", "zoomed"):
+        return
+    if overlay is None:
+        overlay = overlay_mode.get()
+    config["overlay_geometry" if overlay else "window_geometry"] = root.geometry()
 
 
 config_save_job = {"id": None}
@@ -811,20 +974,22 @@ def schedule_config_save(delay=700):
     """Debounce config writes -- <Configure> fires constantly while dragging."""
     if config_save_job["id"]:
         root.after_cancel(config_save_job["id"])
-    config_save_job["id"] = root.after(delay, save_config)
+    config_save_job["id"] = root.after(delay, lambda: storage.save_config(config))
 
 
 def on_configure(event):
-    if event.widget is root and root.state() != "withdrawn":
+    if event.widget is root:
         remember_geometry()
         schedule_config_save()
 
 
 def quit_app(event=None):
-    autosave_current()
+    if root.state() == "withdrawn":
+        root.deiconify()  # any question below needs a visible parent
+    if not resolve_unsaved("quit"):
+        return
     remember_geometry()
-    config["autosave"] = bool(autosave_enabled.get())
-    save_config()
+    storage.save_config(config)
     if hotkey_thread:
         hotkey_thread.stop()
     root.destroy()
@@ -846,19 +1011,23 @@ def build_overlay_menu():
     menu = tk.Menu(root, tearoff=0)
 
     menu.add_checkbutton(label="Overlay mode", variable=overlay_mode, command=apply_mode)
-    menu.add_checkbutton(label="Always on top", variable=topmost, command=apply_topmost)
+    menu.add_checkbutton(label="Always on top", variable=topmost, command=apply_topmost,
+                         state=tk.DISABLED if overlay_mode.get() else tk.NORMAL)
     menu.add_checkbutton(label="Click-through", variable=click_through,
-                         command=toggle_click_through)
+                         command=toggle_click_through,
+                         state=tk.NORMAL if overlay_mode.get() and IS_WINDOWS else tk.DISABLED)
     menu.add_checkbutton(label="Show sidebar", variable=sidebar_visible, command=toggle_sidebar)
-    menu.add_checkbutton(label="Hide from taskbar", variable=hide_from_taskbar,
-                         command=on_taskbar_setting)
+    if IS_WINDOWS:
+        menu.add_checkbutton(label="Hide from taskbar", variable=hide_from_taskbar,
+                             command=on_taskbar_setting)
     menu.add_checkbutton(label="Autosave", variable=autosave_enabled, command=on_autosave_setting)
 
     opacity_menu = tk.Menu(menu, tearoff=0)
     for percent in (100, 90, 80, 70, 60, 50, 35):
         opacity_menu.add_command(label="%d%%" % percent,
                                  command=lambda p=percent: set_opacity(p / 100))
-    menu.add_cascade(label="Opacity", menu=opacity_menu)
+    menu.add_cascade(label="Opacity", menu=opacity_menu,
+                     state=tk.NORMAL if overlay_mode.get() else tk.DISABLED)
 
     theme_menu = tk.Menu(menu, tearoff=0)
     for name in ("journal", "litera", "flatly", "sandstone",
@@ -871,7 +1040,7 @@ def build_overlay_menu():
     menu.add_command(label="Save note", command=save_note)
     menu.add_command(label="Info / hotkeys", command=show_info)
     menu.add_separator()
-    menu.add_command(label="Hide (%s)" % GLOBAL_HOTKEYS["toggle_visible"][2], command=hide_window)
+    menu.add_command(label="Hide (Esc)", command=hide_window)
     menu.add_command(label="Quit", command=quit_app)
     return menu
 
@@ -902,12 +1071,6 @@ HOTKEY_ACTIONS = {
     "opacity_down": lambda: nudge_opacity(-OPACITY_STEP),
 }
 
-
-def on_title_key(event):
-    global dirty
-    dirty = True
-
-
 # -------------------------------
 # Wire everything up
 # -------------------------------
@@ -924,11 +1087,13 @@ titlebar.bind("<Double-Button-1>", lambda e: toggle_collapse())
 titlebar.bind("<Button-3>", popup_menu)
 titlebar_label.bind("<Button-3>", popup_menu)
 
-content_text.bind("<<Modified>>", mark_dirty)
-title_entry.bind("<KeyRelease>", on_title_key)
+content_text.bind("<<Modified>>", on_text_modified)
+title_var.trace_add("write", on_title_changed)
 
-root.bind("<Control-s>", save_note)
-root.bind("<Control-n>", new_note)
+for key in ("s", "S"):
+    root.bind("<Control-%s>" % key, save_note)
+for key in ("n", "N"):
+    root.bind("<Control-%s>" % key, new_note)
 root.bind("<Control-Shift-O>", lambda e: toggle_overlay_mode())
 root.bind("<F1>", lambda e: show_info())
 root.bind("<Escape>", hide_window)
@@ -938,17 +1103,17 @@ root.protocol("WM_DELETE_WINDOW", quit_app)
 # -------------------------------
 # On startup, load notes and populate the sidebar.
 # -------------------------------
-load_notes_from_file()
 update_treeview()
 apply_theme()
 toggle_sidebar()
-set_opacity(config["opacity"], announce=False)
 apply_mode(initial=True)
-apply_topmost()
 start_hotkeys()
-mark_clean()
+load_into_editor(None)
 
-if overlay_mode.get() and IS_WINDOWS:
-    set_status("%s hides VerTab" % GLOBAL_HOTKEYS["toggle_visible"][2], clear_after=5000)
+if notes_warning:
+    root.after(300, lambda: messagebox.showwarning("Notebook recovered", notes_warning, parent=root))
+elif overlay_mode.get() and IS_WINDOWS:
+    set_status("Esc hides VerTab — %s brings it back"
+               % GLOBAL_HOTKEYS["toggle_visible"][2], clear_after=5000)
 
 root.mainloop()

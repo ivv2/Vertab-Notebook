@@ -12,9 +12,11 @@ from PyInstaller.utils.hooks import collect_all
 
 datas, binaries, hiddenimports = collect_all("ttkbootstrap")
 
+for asset in ("vertab.ico", "vertab.png"):
+    if os.path.exists(os.path.join("assets", asset)):
+        datas += [(os.path.join("assets", asset), "assets")]
+
 ICON = os.path.join("assets", "vertab.ico")
-if os.path.exists(ICON):
-    datas += [(ICON, "assets")]
 
 a = Analysis(
     ["VertabNB.py"],
@@ -42,9 +44,11 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    # UPX-packed executables trip antivirus heuristics far more often.
+    upx=False,
     runtime_tmpdir=None,
     console=False,          # GUI app: no console window behind it
     disable_windowed_traceback=False,
     icon=ICON if os.path.exists(ICON) else None,
+    version="version_info.txt",
 )
